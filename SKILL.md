@@ -87,7 +87,7 @@ comment is not posted, and its watcher is not started.
 - `--claude`: Claude only. Never post `@codex review`. If the PR has no Claude review and none
   is running, say so and stop. The loop ends when a round fixes no Claude finding (nothing to
   re-request → step 8) or when the re-review comes back with no new findings
-  (`CLAUDE_REVIEWED inline=0`). Step 7 starts the Monitor with `watch-claude.sh` alone.
+  (`CLAUDE_REVIEWED inline=0`). Step 7 watches with `claude` specs only.
 
 ## Ignore rules
 
@@ -161,7 +161,7 @@ and 7 once for the whole stack:
 3. Reply, resolve and re-request (step 6) on **every PR that got a fix or a decline** in this
    round. Keep each trigger comment's id and timestamp per PR. PRs that had nothing to address
    are not re-requested. `@claude review` goes only on the PRs where a Claude finding was fixed.
-4. Watch all triggered PRs together (step 7, stack variant). The next round starts when every
+4. Watch all triggered PRs together (step 7, one spec per PR and bot). The next round starts when every
    watched PR has printed a result — from Codex, and from Claude where it was triggered;
    feedback on any layer means another round over the whole work set (layers with no new
    feedback simply have nothing to fix that round).
@@ -217,7 +217,7 @@ gh api --paginate repos/{owner}/{repo}/pulls/<pr>/reviews \
 ```
 
 If Claude's first review is still running (its check run on the PR head is not `completed`), wait
-for it with `watch-claude.sh` (step 7, `since` = PR creation time) before triaging, so its
+for it with a `claude` spec (step 7, `since` = PR creation time) before triaging, so its
 findings land in this round. Never request a first Claude review on a PR that has none.
 
 First round: take all of them. Later rounds: only threads with `created_at` after the last
@@ -334,60 +334,46 @@ Only after the push is confirmed (step 4):
   gh api repos/{owner}/{repo}/issues/<pr>/comments -f body="@claude review" --jq '.created_at'
   ```
 
-## 7. Watch until Codex reacts
+## 7. Watch until the bots react
 
 Start a `Monitor` (load it with ToolSearch if it is deferred), `timeout_ms: 1800000`, from the
 repository checkout:
 
 ```bash
-~/.claude/skills/fix-pr/watch-codex.sh <pr> <since> [<trigger-comment-id>]
+~/.claude/skills/fix-pr/watch.sh <spec> [<spec> ...]
 ```
 
-Omit the trigger id when watching a freshly opened PR (the 👍 then lands on the PR itself). The
-script polls every 45s and prints exactly one line before exiting:
+One spec per review that is pending — every bot and every PR (all triggered PRs of a stack) go
+in the same call:
+
+- `codex,<pr>,<since>[,<trigger-comment-id>]` — omit the trigger id when watching a freshly
+  opened PR (the 👍 then lands on the PR itself).
+- `claude,<pr>,<since>` — for a Claude review requested in step 6 or already running.
+
+For example `watch.sh codex,123,<since>,<trigger-id> claude,123,<claude-since>`. The script
+polls every 45s, prints one `<pr> <result>` line per spec as each one lands, and exits when all
+of them have one:
 
 | Output | Next |
 |---|---|
-| `CODEX_APPROVED` | Done → step 8. |
-| `CODEX_FEEDBACK reviews=N inline=N comments=N` | Back to step 2 with `since` = trigger time. If every new comment is ignored, or the only new item is a Codex note saying it found no issues, stop → step 8. |
-| `PR_NOT_OPEN state=…` | Step 5. |
-
-**Stack mode** watches every triggered PR in one Monitor:
-
-```bash
-~/.claude/skills/fix-pr/watch-stack.sh <pr>,<since>[,<trigger-comment-id>] [<pr>,<since>[,<trigger>] ...]
-```
-
-It prints one `<pr> <result>` line per PR as each one lands (same results as above) and exits
-when all of them have one. Act on the lines per PR: any `CODEX_FEEDBACK` → another round over the
-work set; `PR_NOT_OPEN` → "Merged layer mid-loop"; all `CODEX_APPROVED` → step 8.
-
-**When a Claude review is pending** (requested in step 6, or already running), chain its watcher
-after the Codex one in the same Monitor command, so the Monitor ends when both bots are done:
-
-```bash
-~/.claude/skills/fix-pr/watch-codex.sh <pr> <since> <trigger-comment-id>; ~/.claude/skills/fix-pr/watch-claude.sh <pr>,<claude-since>
-```
-
-Stack mode: `watch-stack.sh <specs…>; watch-claude.sh <pr>,<claude-since> [<pr>,<claude-since> …]`
-with one spec per PR that has a Claude review pending. It prints one line per PR:
-
-| Output | Next |
-|---|---|
+| `<pr> CODEX_APPROVED` | Codex is done on that PR. |
+| `<pr> CODEX_FEEDBACK reviews=N inline=N comments=N` | Back to step 2 with `since` = trigger time. If every new comment is ignored, or the only new item is a Codex note saying it found no issues, Codex is done on that PR. |
 | `<pr> CLAUDE_REVIEWED inline=0 title=Code review found no issues` | Claude is done on that PR. |
 | `<pr> CLAUDE_REVIEWED inline=N title=…` (N > 0) | New findings → back to step 2 with Claude's `since`. |
 | `<pr> CLAUDE_REVIEWED … title=Code review declined` | The review did not run (budget). Don't re-request; say so in the report. |
-| `<pr> PR_NOT_OPEN state=…` | Step 5. |
+| `<pr> PR_NOT_OPEN state=…` | Step 5 (stack mode: "Merged layer mid-loop"). Printed once per spec of that PR. |
 
-Any other title with `inline=0` (`title=unknown`, `… skipped — no new changes`, `… not repeated —
-earlier findings still open`): read Claude's latest review summary (step 2) before deciding.
+Any other Claude title with `inline=0` (`title=unknown`, `… skipped — no new changes`, `… not
+repeated — earlier findings still open`): read Claude's latest review summary (step 2) before
+deciding.
 
-Start the next round only when every watcher has printed its line: pushing while a bot is still
-reviewing makes it review a stale commit. The run is done when Codex's result is terminal
-(`CODEX_APPROVED` or only-ignored feedback) **and** Claude left nothing new to address.
+Start the next round only when every spec has printed its line: pushing while a bot is still
+reviewing makes it review a stale commit. Any feedback → another round (stack mode: over the
+whole work set). The run is done → step 8 when every Codex result is terminal (`CODEX_APPROVED`
+or only-ignored feedback) **and** Claude left nothing new to address.
 
 While watching, don't poll by hand — end the turn with a one-line status. If the monitor expires
-with no event, re-arm it (stack mode: only with the PRs that have not printed yet); after ~90
+with no event, re-arm it (only with the specs that have not printed yet); after ~90
 minutes without a reaction from a watched bot, stop and tell the user (the bot may be down or
 not enabled on the repo).
 
